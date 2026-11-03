@@ -25,7 +25,7 @@ use ui::{ButtonLike, ContextMenu, ElevationIndex, PopoverMenuHandle, TintColor, 
 use util::ResultExt as _;
 use workspace::{
     ModalView, OpenMode, Workspace,
-    notifications::{DetachAndPromptErr, NotifyTaskExt},
+    notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
 };
 use zed_actions;
 
@@ -49,6 +49,7 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+pub mod merge_editor;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -253,6 +254,37 @@ pub fn init(cx: &mut App) {
                 });
             });
         }
+        workspace.register_action(
+            |workspace, _: &zed_actions::git::OpenMergeEditor, window, cx| {
+                use settings::Settings as _;
+                if !git_panel_settings::GitPanelSettings::get_global(cx).merge_editor {
+                    return;
+                }
+                let Some(project_path) = workspace
+                    .active_item(cx)
+                    .and_then(|item| item.project_path(cx))
+                else {
+                    return;
+                };
+                let workspace_weak = workspace.weak_handle();
+                let open_workspace = workspace_weak.clone();
+                cx.spawn_in(window, async move |_, mut cx| {
+                    let task = cx.update(|window, cx| {
+                        crate::merge_editor::MergeEditor::open(
+                            project_path,
+                            open_workspace,
+                            window,
+                            cx,
+                        )
+                    })?;
+                    task.await
+                        .notify_workspace_async_err(workspace_weak, &mut cx);
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            },
+        );
+
         workspace.register_action(|workspace, action: &git::StashAll, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;

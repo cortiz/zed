@@ -100,7 +100,7 @@ use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
     DraggedSelection, Item, ModalView, SelectedEntry, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
-    notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
+    notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
 };
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
@@ -2738,6 +2738,17 @@ impl GitPanel {
             let target =
                 Self::diff_target_for_section(self.section_for_entry_index(selected_index));
 
+            // Unmerged paths get the dedicated 3-way merge editor in place of
+            // the project-wide diff view, but only when the user has opted in
+            // via `git_panel.merge_editor`.
+            if entry.status.is_conflicted() && GitPanelSettings::get_global(cx).merge_editor {
+                let path = git_repo
+                    .read(cx)
+                    .repo_path_to_project_path(&entry.repo_path, cx)?;
+                self.open_merge_editor_for(path, window, cx);
+                return Some(());
+            }
+
             if target == DiffTarget::Uncommitted
                 && let Some(project_diff) = workspace.read(cx).active_item_as::<ProjectDiff>(cx)
                 && let Some(project_path) = project_diff.read(cx).active_project_path(cx)
@@ -2771,6 +2782,24 @@ impl GitPanel {
         });
     }
 
+    fn open_merge_editor_for(
+        &self,
+        path: project::ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let open_workspace = workspace.clone();
+        cx.spawn_in(window, async move |_, mut cx| {
+            let task = cx.update(|window, cx| {
+                crate::merge_editor::MergeEditor::open(path, open_workspace, window, cx)
+            })?;
+            task.await.notify_workspace_async_err(workspace, &mut cx);
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn open_solo_diff(
         &mut self,
         _: &menu::SecondaryConfirm,
@@ -2796,17 +2825,27 @@ impl GitPanel {
         let Some(repository) = self.active_repository.as_ref() else {
             return;
         };
+        let use_merge_editor = GitPanelSettings::get_global(cx).merge_editor;
         let project_paths = self
             .effective_status_entries()
             .iter()
             .filter_map(|entry| {
-                repository
+                let project_path = repository
                     .read(cx)
-                    .repo_path_to_project_path(&entry.repo_path, cx)
+                    .repo_path_to_project_path(&entry.repo_path, cx)?;
+                // Unmerged paths get the 3-way merge editor instead of a plain
+                // editor, but only when the user has opted in via the
+                // `git_panel.merge_editor` setting.
+                let open_in_merge_editor = use_merge_editor && entry.status.is_conflicted();
+                Some((project_path, open_in_merge_editor))
             })
             .collect::<Vec<_>>();
 
-        for project_path in project_paths {
+        for (project_path, open_in_merge_editor) in project_paths {
+            if open_in_merge_editor {
+                self.open_merge_editor_for(project_path, window, cx);
+                continue;
+            }
             self.workspace
                 .update(cx, |workspace, cx| {
                     workspace

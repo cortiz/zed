@@ -41,8 +41,8 @@ use git::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
         GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-        Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
-        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UnmergedStages,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -10398,6 +10398,47 @@ impl Repository {
                 }
             }
         })
+    }
+
+    /// Returns the base / ours / theirs (index stages 1/2/3) for an unmerged
+    /// path. Each side is `None` for a missing stage (e.g. a modify/delete
+    /// conflict) or non-UTF-8 blob. Returns a fully-`None` value for paths
+    /// that are not unmerged.
+    ///
+    /// Remote repositories are not yet supported and will return a fully-`None`
+    /// value; the 3-way merge editor only opens local files for now.
+    pub fn load_unmerged_stages(
+        &mut self,
+        repo_path: RepoPath,
+        cx: &App,
+    ) -> Task<Result<UnmergedStages>> {
+        let rx = self.send_job("load_unmerged_stages", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    anyhow::Ok(backend.load_unmerged_stages(repo_path).await)
+                }
+                RepositoryState::Remote(_) => Ok(UnmergedStages::default()),
+            }
+        });
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
+
+    /// Re-runs git's 3-way merge for an unmerged path and returns the file
+    /// content with diff3-style markers, regardless of the user's
+    /// `merge.conflictStyle` config. Used by the merge editor to present a
+    /// base section when the working tree was written with 2-way markers.
+    pub fn merge_file_diff3(&mut self, repo_path: RepoPath, cx: &App) -> Task<Result<String>> {
+        let rx = self.send_job("merge_file_diff3", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.merge_file_diff3(repo_path).await
+                }
+                RepositoryState::Remote(_) => Err(anyhow!(
+                    "merge_file_diff3 is not supported on remote repositories"
+                )),
+            }
+        });
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
     }
 
     fn paths_changed(

@@ -827,6 +827,13 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: expanded
     pub commit_editor: Option<GitPanelCommitEditor>,
+
+    /// Whether opening a conflicted file from the git panel uses the
+    /// dedicated 3-way merge editor (Ours / Result / Theirs side panes).
+    /// When disabled, conflicted files open the way they do today.
+    ///
+    /// Default: false
+    pub merge_editor: Option<bool>,
 }
 
 #[derive(

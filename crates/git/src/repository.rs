@@ -96,6 +96,21 @@ fn normalize_git_metadata_path(path: PathBuf) -> Result<PathBuf> {
         .map_err(|_| anyhow!("git metadata path escapes its filesystem root: {path:?}"))
 }
 
+/// Picks the incoming branch name out of `.git/MERGE_MSG`. Git writes the
+/// first line as `Merge branch 'foo' into bar` (or `Merge branches 'foo',
+/// 'baz'`); we just want `foo`. Returns `None` if the message doesn't match
+/// the standard shape — caller falls back to a generic label.
+fn parse_merge_msg_branch(msg: &str) -> Option<String> {
+    let first_line = msg.lines().next()?;
+    let after_quote = first_line.split_once('\'')?.1;
+    let branch = after_quote.split_once('\'')?.0;
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_owned())
+    }
+}
+
 /// Commit data needed for the git graph visualization.
 #[derive(Debug, Clone)]
 pub struct CommitData {
@@ -804,6 +819,21 @@ pub trait GitRepository: Send + Sync {
     }
     fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>>;
 
+    /// Returns the base/ours/theirs (index stages 1/2/3) for an unmerged path.
+    /// Each side is `None` when that stage is absent (e.g. a modify/delete
+    /// conflict has no `theirs`) or when the blob is not valid UTF-8.
+    /// Returns a fully-`None` `UnmergedStages` for paths that are not unmerged.
+    fn load_unmerged_stages(&self, path: RepoPath) -> BoxFuture<'_, UnmergedStages>;
+
+    /// Re-runs git's 3-way merge for an unmerged path and returns the
+    /// resulting working-tree content with diff3-style markers (i.e.
+    /// `<<<<<<<`, `|||||||` base section, `=======`, `>>>>>>>`). Lets the
+    /// merge editor present a base section even when the user's config has
+    /// `merge.conflictStyle = merge` (the 2-way default) and the working
+    /// tree on disk was written without `|||||||` markers. Returns `Err`
+    /// when the path isn't unmerged or its stages aren't UTF-8.
+    fn merge_file_diff3(&self, path: RepoPath) -> BoxFuture<'_, Result<String>>;
+
     fn set_index_text(
         &self,
         path: RepoPath,
@@ -1324,6 +1354,25 @@ impl RealGitRepository {
     }
 }
 
+/// Git index stage numbers for an unmerged path.
+/// See: https://git-scm.com/docs/git-merge#_how_conflicts_are_presented
+pub const STAGE_NORMAL: i32 = 0;
+pub const STAGE_BASE: i32 = 1;
+pub const STAGE_OURS: i32 = 2;
+pub const STAGE_THEIRS: i32 = 3;
+
+/// The three sides of a 3-way merge for a single path, as recorded by git in
+/// the index when a path is unmerged. Each side is `None` when that stage is
+/// absent (e.g., file added on both branches has no base; a modify/delete
+/// conflict has no `ours` or no `theirs`) or when the content is not valid
+/// UTF-8 (binary blob).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnmergedStages {
+    pub base: Option<String>,
+    pub ours: Option<String>,
+    pub theirs: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct GitCommitter {
     pub name: Option<String>,
@@ -1608,6 +1657,117 @@ impl GitRepository for RealGitRepository {
                 String::from_utf8_lossy(&output.stderr),
             );
             Ok(())
+        }
+        .boxed()
+    }
+
+    fn load_unmerged_stages(&self, path: RepoPath) -> BoxFuture<'_, UnmergedStages> {
+        let future = (!path.is_empty()).then(|| {
+            let path = path.as_unix_str();
+            // `:<stage>:<path>` addresses an unmerged index stage directly,
+            // so `cat-file --batch` reads all three sides in one process.
+            self.load_revisions(
+                [STAGE_BASE, STAGE_OURS, STAGE_THEIRS]
+                    .iter()
+                    .map(|stage| format!(":{stage}:{path}"))
+                    .collect(),
+            )
+        });
+        async move {
+            let Some(future) = future else {
+                return UnmergedStages::default();
+            };
+            let Some(stages) = future.await.context("loading unmerged stages").log_err() else {
+                return UnmergedStages::default();
+            };
+            let mut stages = stages
+                .into_iter()
+                .map(|content| content.and_then(|bytes| String::from_utf8(bytes).ok()));
+            UnmergedStages {
+                base: stages.next().flatten(),
+                ours: stages.next().flatten(),
+                theirs: stages.next().flatten(),
+            }
+        }
+        .boxed()
+    }
+
+    fn merge_file_diff3(&self, path: RepoPath) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        let git_dir = self.path();
+        let stages = self.load_unmerged_stages(path.clone());
+        let merge_message = self.merge_message();
+        async move {
+            anyhow::ensure!(!path.is_empty(), "empty path has no merge file");
+            let stages = stages.await;
+            let base = stages
+                .base
+                .context("path has no base stage (added on both sides?)")?;
+            let ours = stages.ours.context("path has no ours stage")?;
+            let theirs = stages.theirs.context("path has no theirs stage")?;
+
+            // Use git's own marker labels — `HEAD` for ours, the incoming
+            // branch name for theirs (parsed from `.git/MERGE_MSG`'s
+            // `Merge branch 'foo'` line), and `merged common ancestors` for
+            // base — so the rewritten markers are indistinguishable from
+            // what git itself would produce with `merge.conflictStyle = diff3`.
+            // The inline conflict view reads these labels back into its
+            // `Use HEAD` / `Use foo` buttons.
+            let their_label = merge_message
+                .await
+                .as_deref()
+                .and_then(parse_merge_msg_branch)
+                .unwrap_or_else(|| "theirs".to_owned());
+
+            // Scratch inputs for `git merge-file` live in the git directory,
+            // like the temporary index files, and are always cleaned up.
+            let scratch_id = Uuid::new_v4();
+            let [ours_path, base_path, theirs_path] = ["ours", "base", "theirs"]
+                .map(|side| git_dir.join(format!("merge-file-{scratch_id}-{side}.tmp")));
+            let _cleanup = util::defer({
+                let paths = [ours_path.clone(), base_path.clone(), theirs_path.clone()];
+                move || {
+                    for path in paths {
+                        std::fs::remove_file(path).ok();
+                    }
+                }
+            });
+            smol::fs::write(&ours_path, ours).await?;
+            smol::fs::write(&base_path, base).await?;
+            smol::fs::write(&theirs_path, theirs).await?;
+
+            let output = git
+                .build_command(&[
+                    OsStr::new("merge-file"),
+                    OsStr::new("-p"),
+                    OsStr::new("--diff3"),
+                    OsStr::new("-L"),
+                    OsStr::new("HEAD"),
+                    OsStr::new("-L"),
+                    OsStr::new("merged common ancestors"),
+                    OsStr::new("-L"),
+                    OsStr::new(&their_label),
+                    ours_path.as_os_str(),
+                    base_path.as_os_str(),
+                    theirs_path.as_os_str(),
+                ])
+                .output()
+                .await?;
+            // `git merge-file` exits with the number of conflicts (capped at
+            // 127) on success and a negative value (255) on error.
+            let succeeded = output
+                .status
+                .code()
+                .is_some_and(|code| (0..=127).contains(&code));
+            anyhow::ensure!(
+                succeeded,
+                GitBinaryCommandError {
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    status: output.status,
+                }
+            );
+            String::from_utf8(output.stdout).context("merge file content is not UTF-8")
         }
         .boxed()
     }
@@ -4394,6 +4554,84 @@ mod tests {
         assert_same_path(
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_unmerged_stages_and_merge_file_diff3(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path();
+        git_init_repo(root);
+        // The working tree is written with plain 2-way markers, so
+        // `merge_file_diff3` has to recover the base section itself.
+        git_command(root, ["config", "merge.conflictStyle", "merge"]);
+        fs::write(root.join("file.txt"), "one\nbase\nthree\n").unwrap();
+        fs::write(root.join("clean.txt"), "clean\n").unwrap();
+        git_command(root, ["add", "."]);
+        git_command(root, ["commit", "-m", "base"]);
+
+        git_command(root, ["checkout", "-b", "feature"]);
+        fs::write(root.join("file.txt"), "one\ntheirs\nthree\n").unwrap();
+        git_command(root, ["commit", "-am", "theirs"]);
+
+        git_command(root, ["checkout", "main"]);
+        fs::write(root.join("file.txt"), "one\nours\nthree\n").unwrap();
+        git_command(root, ["commit", "-am", "ours"]);
+
+        #[allow(clippy::disallowed_methods)]
+        let merge = std::process::Command::new("git")
+            .args(["merge", "feature"])
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "merge should conflict");
+
+        let repository =
+            RealGitRepository::new(&root.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        let path = RepoPath::new("file.txt").unwrap();
+        assert_eq!(
+            repository.load_unmerged_stages(path.clone()).await,
+            UnmergedStages {
+                base: Some("one\nbase\nthree\n".into()),
+                ours: Some("one\nours\nthree\n".into()),
+                theirs: Some("one\ntheirs\nthree\n".into()),
+            }
+        );
+        assert_eq!(
+            repository
+                .load_unmerged_stages(RepoPath::new("clean.txt").unwrap())
+                .await,
+            UnmergedStages::default(),
+        );
+
+        assert_eq!(
+            repository.merge_file_diff3(path).await.unwrap(),
+            "one\n\
+             <<<<<<< HEAD\n\
+             ours\n\
+             ||||||| merged common ancestors\n\
+             base\n\
+             =======\n\
+             theirs\n\
+             >>>>>>> feature\n\
+             three\n"
+        );
+        assert!(
+            repository
+                .merge_file_diff3(RepoPath::new("clean.txt").unwrap())
+                .await
+                .is_err()
         );
     }
 

@@ -34,6 +34,7 @@ pub struct GitPanelSettings {
     pub commit_title_max_length: usize,
     pub entry_primary_click_action: GitPanelClickBehavior,
     pub commit_editor: GitPanelCommitEditor,
+    pub merge_editor: bool,
 }
 
 #[derive(Default)]
@@ -84,6 +85,7 @@ impl Settings for GitPanelSettings {
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
             entry_primary_click_action: git_panel.entry_primary_click_action.unwrap(),
             commit_editor: git_panel.commit_editor.unwrap(),
+            merge_editor: git_panel.merge_editor.unwrap(),
         }
     }
 }

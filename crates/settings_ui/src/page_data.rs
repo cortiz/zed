@@ -8758,6 +8758,30 @@ fn version_control_page() -> SettingsPage {
         ]
     }
 
+    fn merge_editor_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Merge Editor"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "3-Way Merge Editor",
+                description: "Open conflicted files in a dedicated 3-way merge editor (Ours / Result / Theirs side panes). When disabled, conflicted files open in the regular project diff view.",
+                field: Box::new(SettingField {
+                    json_path: Some("git_panel.merge_editor"),
+                    pick: |settings_content| {
+                        settings_content.git_panel.as_ref()?.merge_editor.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .merge_editor = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     SettingsPage {
         title: "Version Control",
         items: concat_sections![
@@ -8768,6 +8792,7 @@ fn version_control_page() -> SettingsPage {
             branch_picker_section(),
             file_diff_section(),
             git_hunks_section(),
+            merge_editor_section(),
         ],
     }
 }

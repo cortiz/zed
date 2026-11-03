@@ -1164,6 +1164,12 @@
     // Choices: expanded, collapsed
     // Default: expanded
     "commit_editor": "expanded",
+    // Whether opening a conflicted file from the git panel uses the dedicated
+    // 3-way merge editor (Ours / Result / Theirs side panes). When disabled,
+    // conflicted files open the way they do today.
+    //
+    // Default: false
+    "merge_editor": false,
   },
   "agent": {
     // Whether the inline assistant should use streaming tools, when available
