@@ -44,14 +44,6 @@ pub(crate) struct ConflictAddon {
     buffers: HashMap<BufferId, BufferConflicts>,
 }
 
-impl ConflictAddon {
-    pub(crate) fn conflict_set(&self, buffer_id: BufferId) -> Option<Entity<ConflictSet>> {
-        self.buffers
-            .get(&buffer_id)
-            .map(|entry| entry.conflict_set.clone())
-    }
-}
-
 struct BufferConflicts {
     block_ids: Vec<(Range<Anchor>, CustomBlockId)>,
     conflict_set: Entity<ConflictSet>,

@@ -15,21 +15,31 @@
 //! unmerged state externally (e.g., the user runs `git add` from a terminal),
 //! a banner appears informing them rather than the merge editor silently
 //! becoming meaningless.
+//!
+//! "Resolve Simple Conflicts" re-merges each conflict line by line and
+//! resolves the ones whose changes don't actually overlap (for example, each
+//! side edited a different, adjacent line). `merge_editor::NextConflict` and
+//! `PreviousConflict` move between the remaining conflicts, and the side
+//! panes follow the Result pane's scroll position.
 
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::BufferDiff;
-use editor::{Editor, EditorEvent, MultiBuffer};
+use editor::{
+    Editor, EditorEvent, MultiBuffer, SelectionEffects, ToPoint as _,
+    scroll::{Autoscroll, ScrollAnchor},
+};
 use git::repository::{RepoPath, UnmergedStages};
 use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, Render, Subscription, Task, WeakEntity, Window,
+    Focusable, IntoElement, Render, Subscription, Task, WeakEntity, Window, actions,
 };
-use language::{Buffer, Capability};
+use language::{Buffer, Capability, OffsetRangeExt as _, Point};
 use project::{
     ConflictRegion, ConflictSetUpdate, Project, ProjectItem as _, ProjectPath,
     git_store::{Repository, RepositoryEvent},
 };
 use std::any::{Any, TypeId};
+use std::ops::Range;
 use std::sync::Arc;
 use ui::prelude::*;
 use ui::{IconButtonShape, Tooltip};
@@ -38,6 +48,28 @@ use workspace::{
     Item, ItemHandle as _, Workspace,
     item::{ItemEvent, SaveOptions, TabContentParams},
 };
+
+use crate::merge_resolution::merge_non_overlapping;
+
+actions!(
+    merge_editor,
+    [
+        /// Resolves every conflict whose two sides change different lines.
+        ResolveSimpleConflicts,
+        /// Moves the cursor in the Result pane to the next conflict.
+        NextConflict,
+        /// Moves the cursor in the Result pane to the previous conflict.
+        PreviousConflict,
+    ]
+);
+
+/// Line hunks (`result rows -> side rows`) used to keep the side panes
+/// scrolled to the part of the file shown in the Result pane.
+struct ScrollMaps {
+    ours: Vec<(Range<u32>, Range<u32>)>,
+    theirs: Vec<(Range<u32>, Range<u32>)>,
+    base: Option<Vec<(Range<u32>, Range<u32>)>>,
+}
 
 /// Which side of a conflict a button accepts.
 #[derive(Clone, Copy)]
@@ -94,6 +126,9 @@ pub struct MergeEditor {
     theirs_side_blocks: Vec<editor::display_map::CustomBlockId>,
     _subscriptions: Vec<Subscription>,
     _subscribe_to_conflict_set: Task<()>,
+    /// Cached row mappings for scroll sync; cleared when the Result buffer
+    /// changes. The side panes are read-only, so only Result can invalidate it.
+    scroll_maps: Option<ScrollMaps>,
 }
 
 #[derive(Copy, Clone, Default)]
@@ -313,11 +348,16 @@ impl MergeEditor {
         // machinery sees dirty/saved/title-changed transitions on this tab.
         // GPUI events don't bubble through `Render`; the workspace subscribes
         // to events on the Item entity itself.
-        subscriptions.push(
-            cx.subscribe(&result_editor, |_, _, event: &EditorEvent, cx| {
+        subscriptions.push(cx.subscribe_in(
+            &result_editor,
+            window,
+            |this, _, event: &EditorEvent, window, cx| {
+                if let EditorEvent::ScrollPositionChanged { local: true, .. } = event {
+                    this.sync_side_pane_scroll(window, cx);
+                }
                 cx.emit(event.clone());
-            }),
-        );
+            },
+        ));
         // Track focus across all panes so `focus_handle` and `act_as_type`
         // can return the editor the user is actually interacting with.
         // Without this, clicking into Ours/Theirs/Base leaves vim and the
@@ -340,6 +380,7 @@ impl MergeEditor {
         // button's enabled state stays current.
         subscriptions.push(cx.subscribe(&result_buffer, |this, _, event, cx| {
             if let language::BufferEvent::Edited { .. } = event {
+                this.scroll_maps = None;
                 this.refresh_resolution_state(cx);
             }
         }));
@@ -395,6 +436,7 @@ impl MergeEditor {
             theirs_side_blocks: Vec::new(),
             _subscriptions: subscriptions,
             _subscribe_to_conflict_set: subscribe_to_conflict_set,
+            scroll_maps: None,
         }
     }
 
@@ -417,20 +459,12 @@ impl MergeEditor {
         !self.conflict_regions(cx).is_empty()
     }
 
-    /// Returns every parsed conflict region in the result buffer, in document
-    /// order. Pulled from the `ConflictAddon` that `git_ui::init` registers on
-    /// every editor; if it isn't there yet (e.g., the first paint), the result
-    /// is empty.
+    /// Returns every conflict region in the result buffer, in document order.
+    /// Parsed directly from the buffer so it doesn't depend on the inline
+    /// conflict view having attached its addon to the Result editor yet.
     fn conflict_regions(&self, cx: &App) -> Vec<project::ConflictRegion> {
-        let editor = self.result_editor.read(cx);
-        let Some(addon) = editor.addon::<crate::conflict_view::ConflictAddon>() else {
-            return Vec::new();
-        };
-        let buffer_id = self.result_buffer.read(cx).remote_id();
-        let Some(conflict_set) = addon.conflict_set(buffer_id) else {
-            return Vec::new();
-        };
-        conflict_set.read(cx).snapshot.conflicts.to_vec()
+        let snapshot = self.result_buffer.read(cx).snapshot();
+        project::ConflictSet::parse(&snapshot).conflicts.to_vec()
     }
 
     /// Accepts the given side for every conflict in the result buffer.
@@ -448,6 +482,133 @@ impl MergeEditor {
                 cx,
             )
             .detach();
+        }
+    }
+
+    /// Conflicts a line-level three-way merge can resolve because their two
+    /// sides change different lines, paired with the merged replacement for
+    /// the whole conflict region (markers included).
+    fn simple_resolutions(&self, cx: &App) -> Vec<(Range<usize>, String)> {
+        let snapshot = self.result_buffer.read(cx).snapshot();
+        let text = |range: &Range<language::Anchor>| {
+            snapshot.text_for_range(range.clone()).collect::<String>()
+        };
+        self.conflict_regions(cx)
+            .iter()
+            .filter_map(|conflict| {
+                let ours = text(&conflict.ours);
+                let theirs = text(&conflict.theirs);
+                let merged = match &conflict.base {
+                    Some(base) => merge_non_overlapping(&text(base), &ours, &theirs)?,
+                    // Without a base we can only tell that both sides agree.
+                    None => (ours == theirs).then_some(ours)?,
+                };
+                Some((conflict.range.to_offset(&snapshot), merged))
+            })
+            .collect()
+    }
+
+    /// Resolves every simple conflict in one edit, so a single undo restores
+    /// all of them.
+    fn resolve_simple_conflicts(&mut self, cx: &mut Context<Self>) {
+        let edits = self.simple_resolutions(cx);
+        if edits.is_empty() {
+            return;
+        }
+        self.result_buffer.update(cx, |buffer, cx| {
+            buffer.edit(edits, None, cx);
+        });
+    }
+
+    /// Moves the Result pane's cursor to the start of the next (or previous)
+    /// conflict, wrapping around at the end of the file.
+    fn go_to_conflict(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let conflicts = self.conflict_regions(cx);
+        if conflicts.is_empty() {
+            return;
+        }
+        self.result_editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let cursor = editor.selections.newest_anchor().head();
+            let starts = conflicts
+                .iter()
+                .filter_map(|conflict| snapshot.anchor_in_excerpt(conflict.range.start))
+                .collect::<Vec<_>>();
+            let target = if forward {
+                starts
+                    .iter()
+                    .find(|start| start.cmp(&cursor, &snapshot).is_gt())
+                    .or(starts.first())
+            } else {
+                starts
+                    .iter()
+                    .rev()
+                    .find(|start| start.cmp(&cursor, &snapshot).is_lt())
+                    .or(starts.last())
+            };
+            if let Some(&target) = target {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_anchor_ranges([target..target]),
+                );
+            }
+        });
+        self.result_editor.focus_handle(cx).focus(window, cx);
+    }
+
+    fn scroll_maps(&mut self, cx: &App) -> &ScrollMaps {
+        self.scroll_maps.get_or_insert_with(|| {
+            // Diff the editors' multibuffer text rather than the raw buffers:
+            // side panes show deleted base lines inline, and scroll anchors
+            // are expressed in those multibuffer rows.
+            let editor_text =
+                |editor: &Entity<Editor>| editor.read(cx).buffer().read(cx).snapshot(cx).text();
+            let result = editor_text(&self.result_editor);
+            let side = |editor: &Entity<Editor>| language::line_diff(&result, &editor_text(editor));
+            ScrollMaps {
+                ours: side(&self.ours_editor),
+                theirs: side(&self.theirs_editor),
+                base: self.base_editor.as_ref().map(side),
+            }
+        })
+    }
+
+    /// Scrolls each side pane so its top line corresponds to the Result
+    /// pane's top line. Lines inside a changed region map to the start of
+    /// the matching region on that side.
+    fn sync_side_pane_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (top_row, offset) = self.result_editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let scroll_anchor = editor.scroll_manager.native_anchor(&display_snapshot, cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            (
+                scroll_anchor.anchor.to_point(&snapshot).row,
+                scroll_anchor.offset,
+            )
+        });
+        let ours_editor = self.ours_editor.clone();
+        let theirs_editor = self.theirs_editor.clone();
+        let base_editor = self.base_editor.clone();
+        let maps = self.scroll_maps(cx);
+        let targets = [
+            (ours_editor, map_row(&maps.ours, top_row)),
+            (theirs_editor, map_row(&maps.theirs, top_row)),
+        ]
+        .into_iter()
+        .chain(
+            base_editor
+                .zip(maps.base.as_ref())
+                .map(|(editor, hunks)| (editor, map_row(hunks, top_row))),
+        )
+        .collect::<Vec<_>>();
+        for (editor, row) in targets {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let anchor = snapshot.anchor_before(Point::new(row, 0));
+                editor.set_scroll_anchor(ScrollAnchor { anchor, offset }, window, cx);
+            });
         }
     }
 
@@ -635,6 +796,27 @@ impl MergeEditor {
                     .color(Color::Muted),
             )
             .child(div().flex_grow(1.))
+            .child({
+                let simple_count = self.simple_resolutions(cx).len();
+                Button::new(
+                    "resolve-simple-conflicts",
+                    if simple_count == 0 {
+                        SharedString::new_static("Resolve Simple Conflicts")
+                    } else {
+                        format!("Resolve Simple Conflicts ({simple_count})").into()
+                    },
+                )
+                .label_size(LabelSize::Small)
+                .disabled(simple_count == 0)
+                .tooltip(|_window, cx| {
+                    Tooltip::for_action(
+                        "Resolve conflicts whose sides change different lines",
+                        &ResolveSimpleConflicts,
+                        cx,
+                    )
+                })
+                .on_click(cx.listener(|this, _, _window, cx| this.resolve_simple_conflicts(cx)))
+            })
             .child(resolution_button)
             .child(
                 IconButton::new(
@@ -748,6 +930,25 @@ impl MergeEditor {
                     ),
             )
     }
+}
+
+/// Maps a Result row to the corresponding row on one side, given the line
+/// hunks between them. Rows inside a changed hunk map into the side's version
+/// of that hunk (clamped to its last line), and rows after it shift by the
+/// hunk's size difference.
+fn map_row(hunks: &[(Range<u32>, Range<u32>)], row: u32) -> u32 {
+    let mut delta = 0i64;
+    for (result_rows, side_rows) in hunks {
+        if row < result_rows.start {
+            break;
+        }
+        if row < result_rows.end {
+            let offset = (row - result_rows.start).min(side_rows.len().saturating_sub(1) as u32);
+            return side_rows.start + offset;
+        }
+        delta = side_rows.end as i64 - result_rows.end as i64;
+    }
+    (row as i64 + delta).max(0) as u32
 }
 
 /// Inserts a "Use this" accept button block above each conflict's region in
@@ -1019,6 +1220,18 @@ impl Render for MergeEditor {
             .child(div().flex_1().size_full().child(self.theirs_editor.clone()));
 
         v_flex()
+            .key_context("MergeEditor")
+            .on_action(
+                cx.listener(|this, _: &ResolveSimpleConflicts, _window, cx| {
+                    this.resolve_simple_conflicts(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &NextConflict, window, cx| {
+                this.go_to_conflict(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousConflict, window, cx| {
+                this.go_to_conflict(false, window, cx)
+            }))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(cx))
@@ -1556,5 +1769,241 @@ mod tests {
                 );
             }
         });
+    }
+
+    const TWO_CONFLICTS: &str = "\
+start
+<<<<<<< HEAD
+ONE
+two
+||||||| merged common ancestors
+one
+two
+=======
+one
+TWO
+>>>>>>> feature
+middle
+<<<<<<< HEAD
+ours
+||||||| merged common ancestors
+x
+=======
+theirs
+>>>>>>> feature
+end
+";
+
+    /// Opens a merge editor on `/project/conflict.txt` containing
+    /// [`TWO_CONFLICTS`]: one conflict whose sides edit adjacent lines (simple)
+    /// and one whose sides edit the same line (real).
+    async fn open_two_conflicts(
+        cx: &mut TestAppContext,
+    ) -> (Entity<MergeEditor>, &mut gpui::VisualTestContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "conflict.txt": TWO_CONFLICTS }),
+        )
+        .await;
+        fs.set_unmerged_paths_for_repo(
+            path!("/project/.git").as_ref(),
+            &[(
+                repo_path("conflict.txt"),
+                UnmergedStatus {
+                    first_head: UnmergedStatusCode::Updated,
+                    second_head: UnmergedStatusCode::Updated,
+                },
+            )],
+        );
+        fs.set_unmerged_stages_for_repo(
+            path!("/project/.git").as_ref(),
+            &[(
+                repo_path("conflict.txt"),
+                UnmergedStages {
+                    base: Some("start\none\ntwo\nmiddle\nx\nend\n".into()),
+                    ours: Some("start\nONE\ntwo\nmiddle\nours\nend\n".into()),
+                    theirs: Some("start\none\nTWO\nmiddle\ntheirs\nend\n".into()),
+                },
+            )],
+        );
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.executor().run_until_parked();
+
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let project_path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path("conflict.txt").into(),
+        };
+        let merge_editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                MergeEditor::open(project_path, workspace.weak_handle(), window, cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+        (merge_editor, cx)
+    }
+
+    #[gpui::test]
+    async fn test_resolve_simple_conflicts(cx: &mut TestAppContext) {
+        let (merge_editor, cx) = open_two_conflicts(cx).await;
+
+        merge_editor.read_with(cx, |this, cx| {
+            assert_eq!(this.conflict_regions(cx).len(), 2);
+            assert_eq!(this.simple_resolutions(cx).len(), 1);
+        });
+
+        cx.dispatch_action(ResolveSimpleConflicts);
+        cx.executor().run_until_parked();
+
+        merge_editor.read_with(cx, |this, cx| {
+            assert_eq!(
+                this.result_buffer.read(cx).text(),
+                "\
+start
+ONE
+TWO
+middle
+<<<<<<< HEAD
+ours
+||||||| merged common ancestors
+x
+=======
+theirs
+>>>>>>> feature
+end
+",
+                "only the adjacent-line conflict should be resolved"
+            );
+            assert_eq!(this.conflict_regions(cx).len(), 1);
+            assert!(this.simple_resolutions(cx).is_empty());
+        });
+
+        // A single undo restores both regions' original markers.
+        merge_editor.update(cx, |this, cx| {
+            this.result_buffer.update(cx, |buffer, cx| buffer.undo(cx));
+        });
+        merge_editor.read_with(cx, |this, cx| {
+            assert_eq!(this.result_buffer.read(cx).text(), TWO_CONFLICTS);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_conflict_navigation(cx: &mut TestAppContext) {
+        let (merge_editor, cx) = open_two_conflicts(cx).await;
+
+        let cursor_row = |merge_editor: &Entity<MergeEditor>, cx: &mut gpui::VisualTestContext| {
+            merge_editor.update(cx, |this, cx| {
+                this.result_editor.update(cx, |editor, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    editor
+                        .selections
+                        .newest_anchor()
+                        .head()
+                        .to_point(&snapshot)
+                        .row
+                })
+            })
+        };
+        let go = |forward: bool,
+                  merge_editor: &Entity<MergeEditor>,
+                  cx: &mut gpui::VisualTestContext| {
+            merge_editor.update_in(cx, |this, window, cx| {
+                this.go_to_conflict(forward, window, cx)
+            });
+            cx.executor().run_until_parked();
+        };
+
+        assert_eq!(cursor_row(&merge_editor, cx), 0);
+        go(true, &merge_editor, cx);
+        assert_eq!(cursor_row(&merge_editor, cx), 1);
+        go(true, &merge_editor, cx);
+        assert_eq!(cursor_row(&merge_editor, cx), 12);
+        go(true, &merge_editor, cx);
+        assert_eq!(
+            cursor_row(&merge_editor, cx),
+            1,
+            "wraps to the first conflict"
+        );
+        go(false, &merge_editor, cx);
+        assert_eq!(
+            cursor_row(&merge_editor, cx),
+            12,
+            "wraps to the last conflict"
+        );
+        go(false, &merge_editor, cx);
+        assert_eq!(cursor_row(&merge_editor, cx), 1);
+    }
+
+    #[gpui::test]
+    async fn test_side_panes_follow_result_scroll(cx: &mut TestAppContext) {
+        let (merge_editor, cx) = open_two_conflicts(cx).await;
+
+        let top_line = |editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext| {
+            editor.update(cx, |editor, cx| {
+                let display_snapshot = editor.display_snapshot(cx);
+                let anchor = editor.scroll_manager.native_anchor(&display_snapshot, cx);
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let row = anchor.anchor.to_point(&snapshot).row;
+                snapshot
+                    .text_for_range(Point::new(row, 0)..Point::new(row + 1, 0))
+                    .collect::<String>()
+            })
+        };
+
+        // Scroll Result so "middle" (row 11) is the top line.
+        merge_editor.update_in(cx, |this, window, cx| {
+            this.result_editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let anchor = snapshot.anchor_before(Point::new(11, 0));
+                editor.set_scroll_anchor(
+                    ScrollAnchor {
+                        anchor,
+                        offset: Default::default(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+
+        let (ours, theirs) = merge_editor.read_with(cx, |this, _| {
+            (this.ours_editor.clone(), this.theirs_editor.clone())
+        });
+        // Side panes show deleted base lines inline, so compare the text of
+        // the top line rather than its row number.
+        assert_eq!(top_line(&ours, cx), "middle\n");
+        assert_eq!(top_line(&theirs, cx), "middle\n");
+    }
+
+    #[test]
+    fn test_map_row() {
+        // Result rows 2..4 were replaced by side rows 2..3; a line was inserted
+        // on the side at result row 6.
+        let hunks = vec![(2..4, 2..3), (6..6, 5..6)];
+        assert_eq!(map_row(&hunks, 0), 0);
+        assert_eq!(map_row(&hunks, 2), 2);
+        assert_eq!(
+            map_row(&hunks, 3),
+            2,
+            "clamped to the side's last hunk line"
+        );
+        assert_eq!(map_row(&hunks, 4), 3);
+        assert_eq!(map_row(&hunks, 5), 4);
+        assert_eq!(map_row(&hunks, 6), 6);
+        assert_eq!(map_row(&hunks, 9), 9);
+        // A deletion on the side maps its rows to the row after it.
+        assert_eq!(map_row(&[(1..3, 1..1)], 2), 1);
+        assert_eq!(map_row(&[(1..3, 1..1)], 5), 3);
     }
 }

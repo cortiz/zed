@@ -1114,6 +1114,13 @@
     },
   },
   {
+    "context": "MergeEditor",
+    "bindings": {
+      "f7": "merge_editor::NextConflict",
+      "shift-f7": "merge_editor::PreviousConflict",
+    },
+  },
+  {
     "context": "GitPanel",
     "bindings": {
       "cmd-1": "git_panel::ActivateChangesTab",
