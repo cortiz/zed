@@ -8765,6 +8765,7 @@ fn version_control_page() -> SettingsPage {
                 title: "3-Way Merge Editor",
                 description: "Open conflicted files in a dedicated 3-way merge editor (Ours / Result / Theirs side panes). When disabled, conflicted files open in the regular project diff view.",
                 field: Box::new(SettingField {
+                    organization_override: None,
                     json_path: Some("git_panel.merge_editor"),
                     pick: |settings_content| {
                         settings_content.git_panel.as_ref()?.merge_editor.as_ref()
