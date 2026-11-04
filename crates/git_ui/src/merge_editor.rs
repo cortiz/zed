@@ -352,8 +352,13 @@ impl MergeEditor {
             &result_editor,
             window,
             |this, _, event: &EditorEvent, window, cx| {
-                if let EditorEvent::ScrollPositionChanged { local: true, .. } = event {
-                    this.sync_side_pane_scroll(window, cx);
+                match event {
+                    EditorEvent::ScrollPositionChanged { local: true, .. } => {
+                        this.sync_side_pane_scroll(window, cx);
+                    }
+                    // Keeps the "Conflict N of M" counter in the header current.
+                    EditorEvent::SelectionsChanged { .. } => cx.notify(),
+                    _ => {}
                 }
                 cx.emit(event.clone());
             },
@@ -556,6 +561,58 @@ impl MergeEditor {
             }
         });
         self.result_editor.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Index of the conflict containing the Result cursor, if any.
+    fn current_conflict_index(&self, conflicts: &[ConflictRegion], cx: &App) -> Option<usize> {
+        let editor = self.result_editor.read(cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_point(&editor.buffer().read(cx).snapshot(cx));
+        let snapshot = self.result_buffer.read(cx).snapshot();
+        conflicts.iter().position(|conflict| {
+            let range = conflict.range.to_point(&snapshot);
+            range.start <= cursor && cursor < range.end.max(Point::new(range.start.row + 1, 0))
+        })
+    }
+
+    fn render_conflict_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let conflicts = self.conflict_regions(cx);
+        let has_conflicts = !conflicts.is_empty();
+        let label: SharedString =
+            match (conflicts.len(), self.current_conflict_index(&conflicts, cx)) {
+                (0, _) => "No conflicts".into(),
+                (total, Some(index)) => format!("Conflict {} of {total}", index + 1).into(),
+                (1, None) => "1 conflict".into(),
+                (total, None) => format!("{total} conflicts").into(),
+            };
+        h_flex()
+            .gap_1()
+            .child(
+                IconButton::new("previous-conflict", IconName::ArrowUp)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(ui::IconSize::Small)
+                    .disabled(!has_conflicts)
+                    .tooltip(|_window, cx| {
+                        Tooltip::for_action("Previous Conflict", &PreviousConflict, cx)
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.go_to_conflict(false, window, cx)),
+                    ),
+            )
+            .child(
+                IconButton::new("next-conflict", IconName::ArrowDown)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(ui::IconSize::Small)
+                    .disabled(!has_conflicts)
+                    .tooltip(|_window, cx| Tooltip::for_action("Next Conflict", &NextConflict, cx))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.go_to_conflict(true, window, cx)),
+                    ),
+            )
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
     }
 
     fn scroll_maps(&mut self, cx: &App) -> &ScrollMaps {
@@ -795,6 +852,7 @@ impl MergeEditor {
                     .size(ui::LabelSize::Small)
                     .color(Color::Muted),
             )
+            .child(self.render_conflict_navigation(cx))
             .child(div().flex_grow(1.))
             .child({
                 let simple_count = self.simple_resolutions(cx).len();
@@ -1923,11 +1981,24 @@ end
             cx.executor().run_until_parked();
         };
 
+        let current = |merge_editor: &Entity<MergeEditor>, cx: &mut gpui::VisualTestContext| {
+            merge_editor.read_with(cx, |this, cx| {
+                this.current_conflict_index(&this.conflict_regions(cx), cx)
+            })
+        };
+
         assert_eq!(cursor_row(&merge_editor, cx), 0);
+        assert_eq!(
+            current(&merge_editor, cx),
+            None,
+            "cursor starts outside any conflict"
+        );
         go(true, &merge_editor, cx);
         assert_eq!(cursor_row(&merge_editor, cx), 1);
+        assert_eq!(current(&merge_editor, cx), Some(0));
         go(true, &merge_editor, cx);
         assert_eq!(cursor_row(&merge_editor, cx), 12);
+        assert_eq!(current(&merge_editor, cx), Some(1));
         go(true, &merge_editor, cx);
         assert_eq!(
             cursor_row(&merge_editor, cx),
